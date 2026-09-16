@@ -32,6 +32,15 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+_record_degraded() {
+    local _reason="$1"
+    local _operation="$2"
+    local _verdict="${3:-degraded}"
+    local _writer="$SCRIPT_DIR/hooks/degraded_audit.sh"
+    [ -f "$_writer" ] || return 0
+    bash "$_writer" bash_safety_hook "$_verdict" "$_reason" "$_operation" >/dev/null 2>&1 || true
+}
+
 # Capture the payload ONCE — jq consumes stdin, and the rm delegation below
 # needs the verbatim payload to re-feed the Python guards.
 RAW=$(cat)
@@ -256,6 +265,7 @@ fi
 case "$CMD" in
     *rm*)
         _delegated=0
+        _degraded_reason="rm_guard_unavailable"
         _py=$(command -v python3 2>/dev/null || true)
         if [ -n "$_py" ] \
            && [ -f "$SCRIPT_DIR/hooks/destructive_command_guard.py" ] \
@@ -270,6 +280,7 @@ case "$CMD" in
                     # Guard crashed/unusable — fall back to the legacy globs
                     # below (degraded, never open).
                     _delegated=0
+                    _degraded_reason="rm_guard_crashed"
                     break
                 fi
             done
@@ -277,9 +288,11 @@ case "$CMD" in
         if [ "$_delegated" -eq 0 ]; then
             case "$CMD" in
                 *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*)  # "rm -rf ." also covers ".."
+                    _record_degraded "$_degraded_reason" rm blocked
                     echo "BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user." >&2
                     exit 2;;
             esac
+            _record_degraded "$_degraded_reason" rm allowed
         fi
         ;;
 esac
@@ -324,6 +337,7 @@ case "$CMD" in
     *git*checkout*|*git*restore*|*git*reset*|*git*switch*|*git*clean*|*git*rm*|*git*mv*|*git*read-tree*)
         _py=$(command -v python3 2>/dev/null || true)
         _handled=0
+        _degraded_reason="git_discard_guard_unavailable"
         if [ -n "$_py" ] && [ -f "$SCRIPT_DIR/hooks/git_discard_guard.py" ]; then
             # Propagate ONLY exit 2 (the clean block). rc 0 = guard ran (snapshot
             # done / clean allowed) -> skip the fallback. A CRASH (rc != 0,2 — e.g.
@@ -339,6 +353,8 @@ case "$CMD" in
                 exit 2
             elif [ "$_rc" -eq 0 ]; then
                 _handled=1
+            else
+                _degraded_reason="git_discard_guard_crashed"
             fi
         fi
         if [ "$_handled" -eq 0 ]; then
@@ -361,9 +377,11 @@ case "$CMD" in
 $(printf '%s\n' "$CMD" | sed -E 's/\|\||&&|;|\||&/\n/g')
 EOF
             if [ "$_gcb" -eq 1 ]; then
+                _record_degraded "$_degraded_reason" git_discard blocked
                 echo "BLOCKED: git clean permanently deletes untracked files (not snapshot-recoverable). Preview with 'git clean -nd', append '# discard-override', or ask the user." >&2
                 exit 2
             fi
+            _record_degraded "$_degraded_reason" git_discard allowed
         fi
         ;;
 esac

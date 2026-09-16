@@ -233,11 +233,12 @@ def write_batch(dir_path: str, rows: Sequence[dict], *, sort_keys: bool = False)
 
 
 #: Every audit store this module backs: env knob -> path under ``~/.genesis``.
-#: ONE table, because five consumers were each re-deriving the answer and three of
+#: ONE table, because consumers were each re-deriving the answer and three of
 #: them derived it differently (Codex P2 x3, PR #1609).
 STORES = {
     "GENESIS_MERGE_OVERRIDE_DIR": "merge_overrides",
     "GENESIS_DISCARD_SNAPSHOT_DIR": "git_discard_snapshots",
+    "GENESIS_DEGRADED_AUDIT_DIR": "hook_degradations",
 }
 
 

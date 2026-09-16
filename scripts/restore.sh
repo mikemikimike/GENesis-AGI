@@ -495,6 +495,8 @@ _backup_has_payload() {
     # run report success having restored nothing.
     find "$d/audit/merge_overrides" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
         2>/dev/null | grep -q . && return 0
+    find "$d/audit/hook_degradations" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
+        2>/dev/null | grep -q . && return 0
     [ -f "$d/secrets/secrets.env.gpg" ] && return 0
     find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
     # §7/§8 also restore secrets/creds from the host-side credential MIRROR when
@@ -874,7 +876,7 @@ _AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # this whole section runs AFTER "Secrets" for exactly that reason: resolving before
 # then put the records in the default directory while the writers went on using the
 # configured one, leaving the recovered audit trail orphaned (Codex P2, PR #1609).
-if [ -f "$SECRETS_FILE" ] && [ -z "${GENESIS_MERGE_OVERRIDE_DIR:-}" ]; then
+if [ -f "$SECRETS_FILE" ] && { [ -z "${GENESIS_MERGE_OVERRIDE_DIR:-}" ] || [ -z "${GENESIS_DEGRADED_AUDIT_DIR:-}" ]; }; then
     # shellcheck source=scripts/lib/load_secrets.sh
     source "$_SCRIPT_DIR/lib/load_secrets.sh" 2>/dev/null || true
     if declare -F load_secrets_file >/dev/null 2>&1; then
@@ -922,6 +924,35 @@ fi
 # credential file mid-restore is dangerous. On a fresh rebuild, move them into
 # place from the staging dir (paths logged below). These live in the Tier-1 git
 # clone, so no off-site pull is needed.
+# Degraded hook events are self-contained, so restore them additively beside the
+# live store. Existing files are never overwritten, even with --force.
+log "--- Degraded hook audit ---"
+_DEGRADED_AUDIT_SRC="$BACKUP_DIR/audit/hook_degradations"
+_DEGRADED_AUDIT_DST="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_DEGRADED_AUDIT_DIR 2>/dev/null \
+    || printf '%s' "$HOME/.genesis/hook_degradations")"
+if [ ! -d "$_DEGRADED_AUDIT_SRC" ]; then
+    log "Degraded hook audit: no backup payload"
+elif $DRY_RUN; then
+    log "Degraded hook audit: would restore $(find "$_DEGRADED_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | wc -l) file(s) -> $_DEGRADED_AUDIT_DST"
+else
+    mkdir -p "$_DEGRADED_AUDIT_DST" && chmod 0700 "$_DEGRADED_AUDIT_DST"
+    _DEGRADED_AUDIT_RESTORED=0
+    while IFS= read -r -d '' _f; do
+        _dst="$_DEGRADED_AUDIT_DST/$(basename "$_f")"
+        if [ ! -e "$_dst" ]; then
+            _tmp="$_dst.partial.$$"
+            if cp "$_f" "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_dst" 2>/dev/null; then
+                chmod 0600 "$_dst" 2>/dev/null || true
+                _DEGRADED_AUDIT_RESTORED=$(( _DEGRADED_AUDIT_RESTORED + 1 ))
+            else
+                rm -f "$_tmp" 2>/dev/null || true
+                warn "degraded audit record $(basename "$_f") could not be restored"
+            fi
+        fi
+    done < <(find "$_DEGRADED_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+    log "Degraded hook audit: $_DEGRADED_AUDIT_RESTORED file(s) restored -> $_DEGRADED_AUDIT_DST"
+fi
+
 log "--- Credential & wiring files ---"
 CREDS_SRC_DIR="$BACKUP_DIR/creds"
 # Key the fallback on actual .gpg PAYLOAD presence, not directory existence:

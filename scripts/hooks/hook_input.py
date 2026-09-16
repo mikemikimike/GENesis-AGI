@@ -30,9 +30,11 @@ dict, never an exception. Hooks must never crash CC.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -359,6 +361,7 @@ def degraded_exit(
     # malformed JSON and for empty stdin, so without this the common case fell through to
     # the match below, matched nothing, and ALLOWED.
     if not raw.strip():
+        _record_degraded(name, 2, reason, "empty_payload")
         _degraded_say(
             2,
             f"GUARD DEGRADED ({name}): {reason} — and the tool payload could not be "
@@ -377,6 +380,7 @@ def degraded_exit(
     except BaseException:  # noqa: BLE001 — a matcher that cannot answer has not cleared it.
         hit = True
     if hit:
+        _record_degraded(name, 2, reason, "gated_operation")
         _degraded_say(
             2,
             f"GUARD DEGRADED ({name}): {reason} — BLOCKING: the raw command text "
@@ -385,6 +389,7 @@ def degraded_exit(
             "intended direction, and there is no in-band waiver for it. The way "
             "through is to repair the hook tree — which is also the actual fix.",
         )
+    _record_degraded(name, 0, reason, "no_gated_operation")
     _degraded_say(
         0,
         f"GUARD DEGRADED ({name}): {reason} — allowing: the raw command text names no "
@@ -392,6 +397,27 @@ def degraded_exit(
         f"this command either.{' ' + also_lost if also_lost else ''} Repair the hook "
         "tree before relying on any of them.",
     )
+
+
+def _record_degraded(name: str, code: int, reason: str, operation: str) -> None:
+    """Record a degraded verdict without making the verdict depend on logging."""
+    writer = Path(__file__).with_name("degraded_audit.sh")
+    with contextlib.suppress(BaseException):
+        subprocess.run(
+            [
+                "bash",
+                str(writer),
+                name,
+                "blocked" if code == 2 else "allowed",
+                reason,
+                operation,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=0.25,
+        )
 
 
 def _join_continuations(command: str) -> str:

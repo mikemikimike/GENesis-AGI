@@ -236,7 +236,11 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     )
 
     body = _HYGIENE.read_text()
-    for knob in ("GENESIS_MERGE_OVERRIDE_DIR", "GENESIS_DISCARD_SNAPSHOT_DIR"):
+    for knob in (
+        "GENESIS_MERGE_OVERRIDE_DIR",
+        "GENESIS_DISCARD_SNAPSHOT_DIR",
+        "GENESIS_DEGRADED_AUDIT_DIR",
+    ):
         assert knob in body, f"the groom never resolves {knob}"
     assert "_load_store_knob() {" in body, (
         "the loader is gone, so the scan below would silently cover the whole file"

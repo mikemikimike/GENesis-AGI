@@ -275,14 +275,14 @@ main() {
     fi
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env.
+    # The store knobs, read BY NAME out of secrets.env.
     #
     # The writers see them because genesis-server loads that file; this unit does
     # not, so without this the trim resolved the DEFAULT directories on an install
     # that had configured custom ones — the real store growing with no retention
     # while the timer reported success on an empty default (Codex P2, PR #1609).
     #
-    # Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
+    # Named variables rather than `EnvironmentFile=` on the unit, for two reasons.
     # MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
     # regardless of directive order, so loading secrets.env would silently replace
     # the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
@@ -309,6 +309,7 @@ main() {
     }
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
+    _load_store_knob GENESIS_DEGRADED_AUDIT_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
     # bound. This is the shape the ghost-export note above explains an age prune
     # cannot handle for an append-forever file. Retention lives here, never on the

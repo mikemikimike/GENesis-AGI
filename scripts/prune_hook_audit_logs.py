@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Size retention for the hook audit stores (merge overrides, discard snapshots).
+"""Size retention for the hook audit stores.
 
 Each store is a directory of small JSONL files, one per hook flush. This deletes the
 OLDEST whole files until a store fits its byte bound, so the stores stay bounded on a
@@ -55,7 +55,7 @@ def main() -> None:
     ap.add_argument(
         "dirs",
         nargs="*",
-        help="store directories to trim (default: the merge-override and discard stores)",
+        help="store directories to trim (default: all configured hook audit stores)",
     )
     ap.add_argument(
         "--max-bytes",

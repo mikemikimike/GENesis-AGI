@@ -728,6 +728,54 @@ if [ -d "$_OVERRIDE_STORE" ]; then
     log "Hook audit stores: $_AUDIT_COUNT file(s), $_AUDIT_DROPPED pruned from mirror"
 fi
 
+# Degraded hook events are self-contained and recoverable, so keep them in the
+# Tier-1 backup alongside the merge audit. The helper uses the same listing,
+# staging, mirror-reconciliation and stale-scrap rules as the merge store.
+_backup_degraded_audit_store() {
+    local store mirror list base file tmp err line listed=true count=0 dropped=0
+    store="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_DEGRADED_AUDIT_DIR 2>/dev/null \
+        || printf '%s' "$HOME/.genesis/hook_degradations")"
+    mirror="audit/hook_degradations"
+    [ -d "$store" ] || return 0
+    mkdir -p "$mirror" || { log "WARNING: could not create $mirror"; return 0; }
+    if ! list="$(mktemp -p "$GENESIS_BIG_TMP")"; then
+        log "WARNING: could not allocate audit listing for $store"
+        return 0
+    fi
+    find "$store" -maxdepth 1 -type f -name '*.jsonl' -print0 > "$list" 2>/dev/null || listed=false
+    while IFS= read -r -d '' file; do
+        base="$(basename "$file")"
+        tmp="$mirror/.$base.partial.$$"
+        err=""
+        if err="$(cp "$file" "$tmp" 2>&1)" && err="$(mv -f "$tmp" "$mirror/$base" 2>&1)"; then
+            count=$((count + 1))
+        else
+            rm -f "$tmp" 2>/dev/null || true
+            log "WARNING: failed to copy degraded audit $base (${err:-no error text})"
+        fi
+    done < "$list"
+    rm -f "$list" 2>/dev/null || true
+    if ! $listed; then
+        log "WARNING: could not list $store - degraded audit mirror prune skipped"
+    else
+        declare -A live=()
+        while IFS= read -r -d '' file; do
+            live["$(basename "$file")"]=1
+        done < <(find "$store" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+        while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            if [ -z "${live[$base]:-}" ]; then
+                rm -f "$file" && dropped=$((dropped + 1))
+            fi
+        done < <(find "$mirror" -maxdepth 1 -type f -name '*.jsonl' -print0 2>/dev/null)
+        unset live
+    fi
+    find "$mirror" -maxdepth 1 -type f -name '.*.partial.*' \
+        ! -name "*.partial.$$" -mmin +60 -delete 2>/dev/null || true
+    log "Degraded hook audit: $count file(s), $dropped pruned from mirror"
+}
+_backup_degraded_audit_store
+
 # --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets

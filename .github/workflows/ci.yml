@@ -779,4 +779,6 @@ jobs:
         # does not. That asymmetry is the trap: an under-set floor still passes,
         # so the guard quietly forfeits the exact fit it exists to hold and
         # nothing says a word.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23217
+        # RAISED 23217 -> 23222 by the five durable degraded-hook audit regression
+        # cases in tests/test_hooks/test_degraded_audit.py; counted after the edit.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23222
