@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -28,10 +29,15 @@ import pytest
 _HOOK = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "adopt_first_gate.py"
 
 
-def _run(mode: str, payload: dict, home: Path) -> subprocess.CompletedProcess:
+def _run(
+    mode: str,
+    payload: dict,
+    home: Path,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Invoke the hook exactly as Claude Code does: argv mode, JSON on stdin."""
     body = {"hook_event_name": "PreToolUse", "session_id": "test", **payload}
-    env = {**os.environ, "HOME": str(home)}
+    env = {**os.environ, "HOME": str(home), **(extra_env or {})}
     return subprocess.run(
         [sys.executable, str(_HOOK), mode],
         input=json.dumps(body),
@@ -89,6 +95,34 @@ def _plan_payload(path: Path) -> dict:
     }
 
 
+def test_missing_hook_input_fails_open_at_import_time(tmp_path: Path):
+    """This guidance hook skips cleanly when its shared parser cannot load."""
+    hook_dir = tmp_path / "broken-hooks"
+    hook_dir.mkdir()
+    hook = hook_dir / "adopt_first_gate.py"
+    shutil.copy2(_HOOK, hook)
+    (hook_dir / "hook_input.py").write_text(
+        'raise RuntimeError("poisoned helper")\n', encoding="utf-8"
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(
+        [sys.executable, str(hook), "--plan"],
+        input="{}",
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(home)},
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "GUARD DEGRADED (adopt_first_gate)" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="the launcher is a POSIX Bash entrypoint",
+)
 @pytest.mark.parametrize("mode", ["--plan", "--new-file"])
 def test_settings_launches_each_mode(mode: str, home: Path, repo: Path):
     root = _HOOK.parents[2]
@@ -96,9 +130,11 @@ def test_settings_launches_each_mode(mode: str, home: Path, repo: Path):
     # without depending on a developer checkout's .venv or main worktree.
     (repo / ".claude/hooks").mkdir(parents=True)
     shutil.copy2(root / ".claude/hooks/genesis-hook", repo / ".claude/hooks/genesis-hook")
-    (repo / "scripts").symlink_to(root / "scripts", target_is_directory=True)
+    (repo / "scripts/hooks").mkdir(parents=True)
+    for name in ("adopt_first_gate.py", "hook_input.py"):
+        shutil.copy2(root / "scripts/hooks" / name, repo / "scripts/hooks" / name)
     (repo / ".venv/bin").mkdir(parents=True)
-    (repo / ".venv/bin/python").symlink_to(sys.executable)
+    shutil.copy2(sys.executable, repo / ".venv/bin/python")
     settings = json.loads((root / ".claude/settings.json").read_text())
     commands = [
         hook["command"]
@@ -150,25 +186,263 @@ def test_the_acceptance_bar_replay_the_real_defect(home: Path, repo: Path):
     assert "/evaluate" in r.stderr, "the remedy must point at the EXISTING skill"
 
 
-def test_a_verdict_clears_the_gate(home: Path):
+def test_a_verdict_clears_the_gate(home: Path, repo: Path):
+    """A documented build decision with search and time estimates is accepted."""
     p = _plan(
         home,
         "# Plan\nAdd `src/genesis/autonomy/desktop_gate.py`.\n\n"
         "## Adopt / Adapt / Build\n"
         "BUILD — cognitive core, no external substitute. Searched: desktop\n"
-        "automation, approval gate. Found: none applicable.\n",
+        "automation, approval gate. Found: none applicable.\n"
+        "Time-to-capability: adopt 2 hours vs build 1 week.\n",
     )
-    assert _run("--plan", _plan_payload(p), home).returncode == 0
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        "TODO: choose ADOPT or BUILD later.",
+        "<ADOPT|ADAPT|BUILD> — <why>",
+        "ADOPT/ADAPT/BUILD — choose one.",
+        "ADOPT|ADAPT|BUILD — choose one.",
+        "ADOPT vs ADAPT vs BUILD — choose one.",
+        "ADOPT —",
+        "ADAPT —",
+        "ADOPT — use the existing adapter or BUILD a custom parser.",
+        "ADOPT — do not adopt this library.",
+        "ADOPT — never adopt this library.",
+        "Do not BUILD this yet.",
+        "Candidates: adopt A or build B. Decision: TBD.",
+        "WATCH — keep looking.",
+        "IGNORE — not relevant.",
+        "BUILD — custom code is more sophisticated.",
+        "BUILD — custom. Searched: none. Found: none applicable. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.",
+        "BUILD — custom. Searched: package index. Found: none applicable. "
+        "Time-to-capability: adopt quickly vs build slowly.",
+        "BUILD — custom. Not searched: package index. Found: none applicable. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.",
+        "BUILD — custom. Searched: will search package index. Found: none applicable. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.",
+        "BUILD — custom. Searched: [search terms]. [more terms]. "
+        "Found: [candidates]. [versions]. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.",
+        "BUILD — custom. Searched: []. Found: !!!. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.",
+    ],
+)
+def test_unresolved_or_unsupported_verdicts_still_block(
+    home: Path, repo: Path, verdict: str
+):
+    """A vocabulary token is not a recorded disposition or build evidence."""
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        f"{verdict}\n",
+    )
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+    assert result.returncode == 2, verdict
+
+
+def test_adapt_is_a_concrete_disposition(home: Path, repo: Path):
+    """An explicit adapt choice does not need build-only evidence fields."""
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADAPT — wrap the existing client behind the repository interface.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_versus_is_valid_in_a_build_time_comparison(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "BUILD — custom. Searched: package index. Found: none applicable. "
+        "Time-to-capability: adopt 2 hours versus build 1 week.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_build_accepts_evidence_label_variants_and_one_concrete_duration(
+    home: Path, repo: Path
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "BUILD — custom implementation.\n"
+        "Search evidence: package index and issue tracker.\n"
+        "Discovery: no applicable candidate.\n"
+        "Time to capability: 3 days.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_build_accepts_inline_evidence_aliases(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "BUILD — custom. Search evidence: package index. Discovery: none. "
+        "Time to capability: 4 h.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_a_verdict_does_not_hide_a_followup_todo(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\nADOPT — use the upstream library.\n"
+        "TODO: run /evaluate before implementation.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+@pytest.mark.parametrize(
+    "status_line",
+    [
+        "Decision status: pending external evaluation.",
+        "- Decision status: pending external evaluation.",
+        "* Status: pending external evaluation.",
+        "1. Decision status: pending external evaluation.",
+        "**Decision status:** pending external evaluation.",
+        "**Decision status**: pending external evaluation.",
+    ],
+)
+def test_a_pending_status_after_a_verdict_does_not_clear_the_gate(
+    home: Path, repo: Path, status_line: str
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\nADOPT — use the upstream library.\n"
+        f"{status_line}\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_pending_in_a_concrete_rationale_is_not_an_unresolved_status(
+    home: Path, repo: Path
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the library to track pending jobs.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_an_or_in_the_rationale_is_not_an_alternative_verdict(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the library for JSON or YAML parsing.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_capability_build_action_is_not_an_alternative_verdict(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the library, which can parse JSON or build an index.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_an_adopt_rationale_can_explain_why_not_to_build(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the upstream parser; do not build a custom one.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_a_later_negation_of_the_selected_disposition_still_blocks(
+    home: Path, repo: Path
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — do not build a custom parser; do not adopt the existing library.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_an_uppercase_alternative_connector_still_blocks(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the existing adapter OR BUILD a custom parser.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_later_in_a_concrete_rationale_is_not_unresolved(home: Path, repo: Path):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "ADOPT — use the scheduler to retry later.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_build_evidence_cannot_claim_findings_are_not_yet_evaluated(
+    home: Path, repo: Path
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\n"
+        "BUILD — custom. Searched: package index. "
+        "Found: not yet evaluated. "
+        "Time-to-capability: adopt 2 hours vs build 1 week.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_a_second_unresolved_verdict_section_does_not_clear_the_gate(
+    home: Path, repo: Path
+):
+    p = _plan(
+        home,
+        "# Plan\nAdd `src/genesis/autonomy/new.py`.\n\n"
+        "## Adopt / Adapt / Build\nADOPT — use the upstream library.\n\n"
+        "## Adopt / Adapt / Build\nTODO: decide after evaluation.\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
 
 
 @pytest.mark.parametrize(
     "heading",
-    ["## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs BUILD", "# adopt - build"],
+    [
+        "## Adopt / Adapt / Build",
+        "## Adopt/Adapt/Build",
+        "### ADOPT vs BUILD",
+        "### ADOPT vs ADAPT vs BUILD",
+        "# adopt - build",
+    ],
 )
-def test_the_heading_spellings_a_writer_will_actually_use(home: Path, heading: str):
+def test_the_heading_spellings_a_writer_will_actually_use(
+    home: Path, repo: Path, heading: str
+):
     """A gate that only accepts one spelling teaches people to fight the gate."""
     p = _plan(home, f"# Plan\nAdd `src/genesis/x.py`.\n\n{heading}\nADOPT — use the library.\n")
-    assert _run("--plan", _plan_payload(p), home).returncode == 0, heading
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0, heading
 
 
 def test_a_plan_that_only_touches_EXISTING_modules_is_silent(home: Path, repo: Path):
@@ -211,7 +485,7 @@ def test_a_plan_with_no_source_files_is_not_this_gates_business(home: Path):
     assert _run("--plan", _plan_payload(p), home).returncode == 0
 
 
-def test_an_empty_verdict_section_does_not_satisfy_the_gate(home: Path):
+def test_an_empty_verdict_section_does_not_satisfy_the_gate(home: Path, repo: Path):
     """The header alone is not a verdict.
 
     This works ONLY because the token match is case-SENSITIVE: the heading
@@ -219,7 +493,7 @@ def test_an_empty_verdict_section_does_not_satisfy_the_gate(home: Path):
     heading satisfy its own requirement and every section could be left blank.
     That is the whole reason this test exists."""
     p = _plan(home, "# Plan\nAdd `src/genesis/x.py`.\n\n## Adopt / Adapt / Build\n\n(tbd)\n")
-    assert _run("--plan", _plan_payload(p), home).returncode == 2
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
 
 
 def test_an_unreadable_plan_never_blocks(home: Path):
@@ -289,6 +563,55 @@ def test_a_path_inside_a_code_fence_is_quoted_not_proposed(home: Path, repo: Pat
     assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
 
 
+@pytest.mark.parametrize(
+    "fence",
+    [
+        "~~~python\n# src/genesis/autonomy/tilde.py\n~~~",
+        "   ```python\n   # src/genesis/autonomy/indented.py\n   ```",
+        "~~~python\n# src/genesis/autonomy/unclosed.py",
+    ],
+)
+def test_all_supported_fence_forms_are_quoted(home: Path, repo: Path, fence: str):
+    p = _plan(home, f"# Plan\nUpdate the docs.\n\n{fence}\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+@pytest.mark.parametrize("extension", ["js", "ts", "html", "css"])
+def test_non_python_executable_sources_are_gated(home: Path, repo: Path, extension: str):
+    """Executable dashboard source additions must receive the plan gate."""
+    p = _plan(home, f"# Plan\nAdd `src/genesis/dashboard/new_panel.{extension}`.\n")
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+    assert result.returncode == 2, extension
+
+
+def test_a_bare_source_path_with_sentence_punctuation_is_gated(home: Path, repo: Path):
+    p = _plan(home, "# Plan\nAdd src/genesis/autonomy/bare_path.py.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+def test_an_absolute_path_outside_the_repository_is_ignored(
+    home: Path, repo: Path, tmp_path: Path
+):
+    foreign = tmp_path / "foreign checkout" / "src" / "genesis" / "outside.py"
+    p = _plan(home, f"# Plan\nAdd `{foreign.as_posix()}`.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_a_relative_source_path_cannot_escape_the_repository(home: Path, repo: Path):
+    p = _plan(home, "# Plan\nAdd `src/genesis/../../../../outside.py`.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_a_longer_data_suffix_is_not_mistaken_for_a_source_file(home: Path, repo: Path):
+    p = _plan(home, "# Plan\nAdd `src/genesis/autonomy/example.py.json`.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+
+def test_absolute_source_path_is_recognized(home: Path, repo: Path):
+    p = _plan(home, f"# Plan\nAdd `{repo.as_posix()}/src/genesis/autonomy/absolute.py`.\n")
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
 def test_the_authoritative_plan_field_wins_over_prose(home: Path, repo: Path):
     """MEASURED: `planFilePath` is present in 1862/1862 real payloads, but `plan`
     (the full markdown) serializes FIRST — so a blob-wide regex could return a
@@ -302,6 +625,131 @@ def test_the_authoritative_plan_field_wins_over_prose(home: Path, repo: Path):
     )
     r = _run("--plan", {**_plan_payload(real), "cwd": str(repo)}, home)
     assert r.returncode == 0, "must read planFilePath, not the first path in the prose"
+
+
+def test_missing_plan_path_does_not_use_another_sessions_newest_plan(home: Path, repo: Path):
+    """Without a path, only an exact unique inline-plan match is inspectable."""
+    live_docs = "# Plan\nUpdate documentation only.\n"
+    newest = home / ".claude" / "plans" / "newest.md"
+    newest.write_text("# Other session\nAdd `src/genesis/autonomy/foreign.py`.\n", encoding="utf-8")
+    payload = {
+        "tool_name": "ExitPlanMode",
+        "tool_input": {"plan": live_docs},
+        "cwd": str(repo),
+    }
+    assert _run("--plan", payload, home).returncode == 0
+
+    matched = home / ".claude" / "plans" / "matched.md"
+    matched.write_text(
+        "# Plan\nAdd `src/genesis/autonomy/inline.py`.\n", encoding="utf-8"
+    )
+    payload["tool_input"]["plan"] = matched.read_text(encoding="utf-8")
+    assert _run("--plan", payload, home).returncode == 2
+
+    duplicate = home / ".claude" / "plans" / "duplicate.md"
+    duplicate.write_text(matched.read_text(encoding="utf-8"), encoding="utf-8")
+    assert _run("--plan", payload, home).returncode == 0
+
+
+def test_superseded_and_archived_content_is_not_live(home: Path, repo: Path):
+    """Archived proposals cannot block and archived verdicts cannot clear a live one."""
+    old_proposal = "Add `src/genesis/autonomy/old.py`.\n"
+    p = _plan(home, "# Plan\nUpdate docs.\n\n## ═══ SUPERSEDED BELOW ═══\n" + old_proposal)
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+    p.write_text(
+        "# Plan\nAdd `src/genesis/autonomy/live.py`.\n\n"
+        "## ARCHIVED\nADOPT — use the library.\n",
+        encoding="utf-8",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+    p.write_text(
+        "# Plan\nUpdate docs.\n\n──── SUPERSEDED ────\n"
+        "Add `src/genesis/autonomy/old_box.py`.\n",
+        encoding="utf-8",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+    p.write_text(
+        "# Plan\nAdd `src/genesis/autonomy/live.py`.\n\n"
+        "ARCHIVED\nADOPT — use the library.\n",
+        encoding="utf-8",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 2
+
+
+@pytest.mark.parametrize(
+    "move_line",
+    [
+        "Rename `src/genesis/autonomy/old.py` to `src/genesis/autonomy/new.py`.",
+        "`src/genesis/autonomy/old.py` -> `src/genesis/autonomy/new.py`.",
+        "git mv `src/genesis/autonomy/old.py` `src/genesis/autonomy/new.py`.",
+    ],
+)
+def test_existing_source_rename_does_not_trigger_but_real_addition_does(
+    home: Path, repo: Path, move_line: str
+):
+    """Existing files moved to a new path do not count as new capabilities."""
+    old = repo / "src" / "genesis" / "autonomy" / "old.py"
+    old.write_text("x = 1\n", encoding="utf-8")
+    p = _plan(
+        home,
+        f"# Plan\n{move_line}\n",
+    )
+    assert _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home).returncode == 0
+
+    p.write_text(
+        f"# Plan\n{move_line} Then add "
+        "`src/genesis/autonomy/real_new.py`.\n",
+        encoding="utf-8",
+    )
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+    assert result.returncode == 2
+    assert "real_new.py" in result.stderr
+    assert "src/genesis/autonomy/new.py" not in result.stderr
+
+
+def test_moving_an_old_file_and_adding_a_new_one_still_blocks(
+    home: Path, repo: Path
+):
+    old = repo / "src" / "genesis" / "autonomy" / "old.py"
+    old.write_text("x = 1\n", encoding="utf-8")
+    p = _plan(
+        home,
+        "# Plan\nMove `src/genesis/autonomy/old.py` and add "
+        "`src/genesis/autonomy/new.py`.\n",
+    )
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+    assert result.returncode == 2
+    assert "new.py" in result.stderr
+
+
+def test_git_location_overrides_cannot_change_payload_repo(home: Path, repo: Path, tmp_path: Path):
+    """Inherited Git location variables must not redirect source existence checks."""
+    foreign = tmp_path / "foreign"
+    (foreign / "src" / "genesis" / "autonomy").mkdir(parents=True)
+    for args in (
+        ["git", "init", "-q", "-b", "foreign"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "config", "user.name", "t"],
+        ["git", "commit", "-q", "--allow-empty", "-m", "init"],
+    ):
+        subprocess.run(args, cwd=foreign, check=True, capture_output=True)
+    (foreign / "src" / "genesis" / "autonomy" / "new.py").write_text("x = 1\n", encoding="utf-8")
+    p = _plan(home, "# Plan\nAdd `src/genesis/autonomy/new.py`.\n")
+    for key, value in (
+        ("GIT_DIR", str(foreign / ".git")),
+        ("GIT_WORK_TREE", str(foreign)),
+        ("GIT_COMMON_DIR", str(foreign / ".git")),
+    ):
+        result = _run(
+            "--plan",
+            {**_plan_payload(p), "cwd": str(repo)},
+            home,
+            {key: value},
+        )
+        assert result.returncode == 2, key
 
 
 # ── the new-file gate, and the anti-annoyance property ───────────────────────
@@ -330,6 +778,15 @@ def test_a_new_module_nudges_once_then_stays_silent(home: Path, repo: Path):
     )
     assert r2.returncode == 0
     assert r2.stdout.strip() == "", "second new file on the same branch must be silent"
+
+
+def test_concurrent_new_file_calls_have_one_sentinel_winner(home: Path, repo: Path):
+    """Only the O_EXCL winner emits a branch advisory during a race."""
+    target = repo / "src" / "genesis" / "autonomy" / "race.py"
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(target)}, "cwd": str(repo)}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: _run("--new-file", payload, home), range(8)))
+    assert sum(bool(result.stdout.strip()) for result in results) == 1
 
 
 def test_a_new_branch_gets_its_own_nudge(home: Path, repo: Path):
@@ -366,6 +823,124 @@ def test_files_outside_the_source_tree_are_silent(home: Path, repo: Path):
             home,
         )
         assert r.stdout.strip() == "", rel
+
+
+def test_non_source_file_inside_source_tree_does_not_consume_nudge(home: Path, repo: Path):
+    """Docs and assets under src/genesis are not new executable modules."""
+    doc = repo / "src" / "genesis" / "skills" / "new-skill.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    result = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(doc)}, "cwd": str(repo)},
+        home,
+    )
+    assert result.stdout.strip() == ""
+
+    source = repo / "src" / "genesis" / "new_module.py"
+    result = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(source)}, "cwd": str(repo)},
+        home,
+    )
+    assert "ADOPT" in result.stdout
+
+
+def test_an_unrelated_repo_path_does_not_consume_the_nudge(home: Path, repo: Path, tmp_path: Path):
+    """Only a new file in this repository's source tree may claim the sentinel."""
+    other = tmp_path / "other-repo" / "src" / "genesis"
+    other.mkdir(parents=True)
+    unrelated = other / "foreign.py"
+    r = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(unrelated)}, "cwd": str(repo)},
+        home,
+    )
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+    real = repo / "src" / "genesis" / "real.py"
+    r = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(real)}, "cwd": str(repo)},
+        home,
+    )
+    assert "ADOPT" in r.stdout, "an out-of-tree path must not consume the branch nudge"
+
+
+def test_a_source_tree_symlink_outside_the_repo_does_not_nudge(
+    home: Path, repo: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-source"
+    outside.mkdir()
+    source_root = repo / "src" / "genesis"
+    shutil.rmtree(source_root)
+    try:
+        source_root.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    target = outside / "new_module.py"
+    result = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(target)}, "cwd": str(repo)},
+        home,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_a_nested_symlink_cannot_hide_a_new_source_as_a_rename(
+    home: Path, repo: Path, tmp_path: Path
+):
+    outside = tmp_path / "outside-source"
+    outside.mkdir()
+    old = outside / "old.py"
+    old.write_text("x = 1\n", encoding="utf-8")
+    link = repo / "src" / "genesis" / "autonomy" / "external"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    p = _plan(
+        home,
+        "# Plan\nRename `src/genesis/autonomy/external/old.py` to "
+        "`src/genesis/autonomy/new.py`.\n",
+    )
+    result = _run("--plan", {**_plan_payload(p), "cwd": str(repo)}, home)
+    assert result.returncode == 2
+    assert "new.py" in result.stderr
+
+
+def test_a_move_payload_does_not_consume_the_nudge(home: Path, repo: Path):
+    """A Write payload describing an existing source move leaves the sentinel unused."""
+    old = repo / "src" / "genesis" / "autonomy" / "old.py"
+    old.write_text("x = 1\n", encoding="utf-8")
+    moved = repo / "src" / "genesis" / "autonomy" / "moved.py"
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(moved), "old_path": str(old)},
+        "cwd": str(repo),
+    }
+    assert _run("--new-file", payload, home).stdout.strip() == ""
+
+    real = repo / "src" / "genesis" / "autonomy" / "real.py"
+    payload["tool_input"] = {"file_path": str(real)}
+    assert "ADOPT" in _run("--new-file", payload, home).stdout
+
+
+def test_new_file_gate_fails_open_without_a_repo_root(home: Path, tmp_path: Path):
+    """A path cannot claim state when its payload repository is unknowable."""
+    cwd = tmp_path / "not-a-repo"
+    target = cwd / "src" / "genesis" / "new.py"
+    target.parent.mkdir(parents=True)
+    r = _run(
+        "--new-file",
+        {"tool_name": "Write", "tool_input": {"file_path": str(target)}, "cwd": str(cwd)},
+        home,
+    )
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
 
 
 # ── wiring: a hook nobody registered is a hook that does nothing ─────────────

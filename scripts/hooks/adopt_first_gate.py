@@ -49,6 +49,7 @@ editing. Nothing in this file is a safety boundary.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -59,20 +60,49 @@ from pathlib import Path
 
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hook_input import field, read_payload, tool_input  # noqa: E402
+try:
+    from hook_input import field, read_payload, tool_input  # noqa: E402
+except Exception:  # noqa: BLE001 — this convenience hook is deliberately fail-open.
+    if __name__ != "__main__":
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (adopt_first_gate): shared hook_input is unavailable; "
+            "skipping this non-safety hook.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — a broken diagnostic stream cannot block work.
+        pass
+    os._exit(0)
 
-_STATE_DIR = Path.home() / ".genesis" / "adopt_first"
+_HOME_DIR = Path(os.environ.get("HOME") or Path.home())
+_STATE_DIR = _HOME_DIR / ".genesis" / "adopt_first"
 
 #: A plan "proposes new source files" if it names a source path. Deliberately
 #: NOT a prose heuristic ("create", "new file") — those fire on any plan that
 #: discusses files at all, and a gate that fires on everything is one you learn
 #: to ack past. A concrete path is the honest signal that code is coming.
-_SOURCE_PATH = re.compile(r"\bsrc/[\w./-]+\.py\b")
+_SOURCE_EXTENSIONS = frozenset(
+    {"py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "html", "htm", "css"}
+)
+_SOURCE_EXTENSION_PATTERN = "|".join(sorted(_SOURCE_EXTENSIONS))
+_SOURCE_PATH = re.compile(
+    rf"(?<![\w./\\:-])(?P<path>(?:(?:[A-Za-z]:)?[\\/](?:[^\\/`'\"<>\r\n]+[\\/])*|\.[\\/])?"
+    rf"src[\\/]genesis[\\/](?:[\w.-]+[\\/])*[\w.-]+\.(?:{_SOURCE_EXTENSION_PATTERN}))"
+    rf"(?=$|[\s`'\"),;:!?\]]|\.(?=$|[\s]))",
+    re.IGNORECASE,
+)
 
 #: The verdict header, tolerant of the spellings a writer will actually use:
-#: "## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs BUILD".
+#: "## Adopt / Adapt / Build", "## Adopt/Adapt/Build", "### ADOPT vs ADAPT vs BUILD".
 _VERDICT_HEADER = re.compile(
-    r"^#{1,6}\s*adopt\s*[/|vs.．\- ]+\s*(adapt|build)", re.IGNORECASE | re.MULTILINE
+    r"^(?P<hash>#{1,6})[ \t]+adopt[ \t]*(?:"
+    r"(?:/[ \t]*|\|[ \t]*|-[ \t]*|vs\.?[ \t]+|versus[ \t]+)"
+    r"adapt[ \t]*(?:/[ \t]*|\|[ \t]*|-[ \t]*|vs\.?[ \t]+|versus[ \t]+)"
+    r"build|"
+    r"(?:/[ \t]*|\|[ \t]*|-[ \t]*|vs\.?[ \t]+|versus[ \t]+)build"
+    r")[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 #: The evaluate skill's vocabulary, matched in the section BODY only.
@@ -84,19 +114,101 @@ _VERDICT_HEADER = re.compile(
 #: genuine lower-case prose verdict under "## Adopt / Adapt / Build" was BLOCKED.
 #: Slicing the body first is what makes the question well-posed, so this can now
 #: be case-insensitive and mean what it says.
-_VERDICT_TOKEN = re.compile(r"\b(ADOPT|ADAPT|BUILD|WATCH|IGNORE)\b", re.IGNORECASE)
-
-#: Fenced code blocks are quoted material, not proposals. A plan showing an
-#: example snippet that names a path is not proposing to create it.
-_FENCE = re.compile(r"^```.*?^```", re.DOTALL | re.MULTILINE)
+_VERDICT_LINE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?"
+    r"(?:(?:verdict|decision|disposition)[ \t]*(?::|=|-)[ \t]*)?"
+    r"(?P<decision>ADOPT|ADAPT|BUILD)\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_PROSE_VERDICT_LINE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?we[ \t]+"
+    r"(?:should|will|recommend|are[ \t]+going[ \t]+to)[ \t]+"
+    r"(?P<decision>ADOPT|ADAPT|BUILD)\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_UNDECIDED = re.compile(
+    r"(?:\b(?:TODO|TBD|TBC|undecided)\b|"
+    r"\bnot[ \t]+(?:yet[ \t]+)?decided\b|<[^>\n]+>)",
+    re.IGNORECASE,
+)
+# A second all-caps disposition is an alternative; lowercase verbs in a rationale
+# ("or build an index") describe capability, not a competing decision.
+_NEGATED_DECISION = re.compile(
+    r"\b(?:do[ \t]+not|does[ \t]+not|did[ \t]+not|don't|doesn't|didn't|"
+    r"not|never|cannot|can't|will[ \t]+not|won't|should[ \t]+not|shouldn't)"
+    r"[ \t]+(?P<decision>ADOPT|ADAPT|BUILD)\b",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_VERDICT = re.compile(
+    r"(?i:^\s*(?:[/|]\s*|vs\.?\s+|versus\s+))"
+    r"(?:ADOPT|ADAPT|BUILD)\b|"
+    r"\b(?:ADOPT|ADAPT|BUILD)\s*[/|]\s*(?:ADOPT|ADAPT|BUILD)\b|"
+    r"(?i:\b(?:or|versus|vs\.?)\b)[^\n]*\b(?:ADOPT|ADAPT|BUILD)\b",
+)
+_FENCE_OPEN = re.compile(r"^(?P<indent> {0,3})(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
+_FENCE_CLOSE = re.compile(r"^[ ]{0,3}(?P<marker>`{3,}|~{3,})[ \t]*$")
+_DIVIDER = r"(?:[═=─━—–-][ \t]*){3,}"
+_SUPERSEDED_DIVIDER = re.compile(
+    rf"^[ ]{{0,3}}(?:#{{1,6}}[ \t]*)?(?:{_DIVIDER}[ \t]*)?"
+    r"(?:SUPERSEDED(?:[ \t]+BELOW)?|ARCHIVED(?:[ \t]+BELOW)?)[ \t]*"
+    rf"(?:{_DIVIDER})?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_UNRESOLVED_FOLLOWUP = re.compile(
+    r"\b(?:TODO|TBD|TBC)\b",
+    re.IGNORECASE,
+)
+_UNRESOLVED_STATUS = re.compile(
+    r"^[ \t]*(?:(?:[-*+]|[0-9]+[.)])[ \t]+)?[*_`]*"
+    r"(?:decision[ \t]+status|status|decision|verdict)[*_`]*[ \t]*"
+    r"(?::|=|-)[*_`]*[ \t]*(?:pending|undecided|not[ \t]+(?:yet[ \t]+)?decided)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PLACEHOLDER_EVIDENCE_PART = (
+    r"(?:TODO|TBD|TBC|N/?A|[-—]|<[^>\r\n]+>|\[[^\]\r\n]+\])"
+)
+_PLACEHOLDER_EVIDENCE = re.compile(
+    rf"{_PLACEHOLDER_EVIDENCE_PART}"
+    rf"(?:[ \t,;:.—-]+{_PLACEHOLDER_EVIDENCE_PART})*\W*",
+    re.IGNORECASE,
+)
+_EVIDENCE_LABEL = (
+    r"(?:searched|search[ \t_-]+evidence|found|findings?|discovery|discoveries|"
+    r"results?|time[ \t_-]+to[ \t_-]+capability)"
+)
+_UNRESOLVED_EVIDENCE = re.compile(
+    r"(?:"
+    r"\b(?:not|never)[ \t]+(?:yet[ \t]+)?(?:been[ \t]+)?"
+    r"(?:evaluated|assessed|reviewed|checked|verified|determined)\b"
+    r"|\b(?:pending|awaiting)(?:[ \t]+\w+){0,3}[ \t]+"
+    r"(?:evaluation|assessment|review|verification|determination)\b"
+    r"|\b(?:to[ \t]+be|yet[ \t]+to[ \t]+be)[ \t]+"
+    r"(?:evaluated|assessed|reviewed|checked|verified|determined)\b"
+    r"|\b(?:will|plan(?:s)?[ \t]+to|intend(?:s)?[ \t]+to|need(?:s)?[ \t]+to)[ \t]+"
+    r"(?:evaluate|assess|review|check|verify|determine)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 _GATED_PREFIX = "src/genesis/"
 
 
 # ── state: one record per (worktree, branch) ─────────────────────────────────
 def _run(args: list[str], cwd: str | None = None) -> str:
+    """Run a bounded Git query without honoring ambient repository overrides."""
+    env = os.environ.copy()
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        env.pop(key, None)
     try:
-        out = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=5, check=False)
+        out = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            env=env,
+        )
         return out.stdout.strip() if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -150,51 +262,58 @@ def _already_nudged(cwd: str) -> bool:
         return False
 
 
-def _mark_nudged(cwd: str) -> None:
-    """Best-effort and atomic. Failing to record costs one extra nudge, which is
-    strictly better than failing the edit."""
+def _mark_nudged(cwd: str) -> bool:
+    """Claim the branch sentinel, returning ``True`` only for its creator."""
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
         # O_EXCL: two concurrent sessions race harmlessly, one wins, neither errors.
-        os.close(os.open(_sentinel(cwd), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+        fd = os.open(_sentinel(cwd), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return True
     except FileExistsError:
-        pass
+        return False
     except OSError:
-        pass
+        return False
 
 
 # ── plan resolution ──────────────────────────────────────────────────────────
 def _plan_path(payload: dict) -> str:
-    """The plan file this ExitPlanMode is about.
+    """Resolve the plan without guessing from another session's mtime.
 
-    Same two-step as ``plan_bookmark_hook._extract_plan_info``: look for an
-    explicit path in the payload, else fall back to the most recently modified
-    plan. Duplicated rather than imported because that module is a PostToolUse
-    hook with its own bookmark side effects, and importing it to reuse thirty
-    lines would drag those along.
+    Claude Code normally supplies ``planFilePath``. Older payloads may carry
+    the full plan text instead; that is safe only when it exactly matches one
+    plan file. An absent or ambiguous association fails open.
     """
+    inputs = tool_input(payload)
     # The AUTHORITATIVE field first. MEASURED across 1,862 real ExitPlanMode
     # payloads on this install: `planFilePath` was present in 1862/1862. The
-    # blob regex below is a fallback for older shapes — and it is a fallback for
-    # a reason: `plan` (the full markdown) serializes BEFORE `planFilePath`, so
-    # a first-match scan can return a path quoted inside the plan's own prose
-    # and then gate on some entirely different document.
+    # inline-content fallback below is deliberately exact-match only; guessing
+    # from a JSON blob or global mtime can select another session's document.
     for key in ("planFilePath", "plan_file_path"):
-        direct = tool_input(payload).get(key) or payload.get(key)
+        direct = inputs.get(key) or payload.get(key)
         if isinstance(direct, str) and direct.endswith(".md"):
             return direct
-    blob = json.dumps(payload)
-    match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", blob)
-    if match:
-        return match.group(1)
-    plans = Path.home() / ".claude" / "plans"
-    if plans.is_dir():
-        try:
-            candidates = sorted(plans.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if candidates:
-                return str(candidates[0])
-        except OSError:
-            pass
+    inline = inputs.get("plan") or payload.get("plan")
+    if not isinstance(inline, str) or not inline.strip():
+        return ""
+    inline_path = Path(inline)
+    if inline_path.suffix.lower() == ".md" and inline_path.is_file():
+        return str(inline_path)
+
+    plans = _HOME_DIR / ".claude" / "plans"
+    matches: list[Path] = []
+    try:
+        for candidate in plans.glob("*.md"):
+            try:
+                if candidate.read_text(encoding="utf-8") == inline:
+                    matches.append(candidate)
+            except OSError:
+                continue
+    except OSError:
+        return ""
+    if len(matches) == 1:
+        return str(matches[0])
     return ""
 
 
@@ -224,8 +343,13 @@ def _repo_root(payload: dict) -> Path | None:
     root = _run(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
     if not root:
         return None
-    candidate = Path(root)
-    return candidate if (candidate / "src" / "genesis").is_dir() else None
+    try:
+        candidate = Path(root).resolve()
+        source_root = (candidate / "src" / "genesis").resolve()
+        source_root.relative_to(candidate)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate if source_root.is_dir() else None
 
 
 _REMEDY = (
@@ -240,8 +364,11 @@ _REMEDY = (
     'Overlap Comparison table exists specifically to replace the sentence "we\n'
     'already have this", which is the phrasing this gate is here to catch.\n'
     "\n"
-    "One line is enough when building really is right:\n"
-    "  BUILD — cognitive core, no external substitute. Searched: <terms>.\n"
+    "A compact record is enough when building really is right:\n"
+    "  BUILD — cognitive core, no external substitute.\n"
+    "  Search evidence: <actual terms or sources>.\n"
+    "  Discovery: <actual candidates/results, or none applicable>.\n"
+    "  Time to capability: <concrete duration>.\n"
     "\n"
     'But RUN THE SEARCH first. "Nothing adoptable exists" is a claim that needs a\n'
     "logged search behind it, and the measured failure this gate is made of had\n"
@@ -249,29 +376,206 @@ _REMEDY = (
 )
 
 
-def _has_verdict(content: str) -> bool:
-    """A verdict is a HEADER with a real answer UNDER it.
+def _without_fenced_blocks(content: str) -> str:
+    """Blank fenced Markdown blocks, including valid unclosed blocks."""
+    lines = content.splitlines()
+    visible: list[str] = []
+    active: tuple[str, int] | None = None
+    for line in lines:
+        if active is not None:
+            closing = _FENCE_CLOSE.match(line)
+            if closing:
+                marker = closing.group("marker")
+                if marker[0] == active[0] and len(marker) >= active[1]:
+                    active = None
+            visible.append("")
+            continue
+        opening = _FENCE_OPEN.match(line)
+        if opening:
+            marker = opening.group("marker")
+            active = (marker[0], len(marker))
+            visible.append("")
+        else:
+            visible.append(line)
+    return "\n".join(visible)
 
-    The body runs from the end of the header line to the next heading of the
-    same-or-shallower depth, which is what makes "the section is empty" and "the
-    section says BUILD" distinguishable at all.
-    """
-    m = _VERDICT_HEADER.search(content)
-    if not m:
+
+def _live_plan_content(content: str) -> str:
+    """Return live plan text, excluding fenced examples and old archaeology."""
+    visible = _without_fenced_blocks(content)
+    divider = _SUPERSEDED_DIVIDER.search(visible)
+    return visible[: divider.start()] if divider else visible
+
+
+def _section_body(content: str, header: re.Match[str]) -> str:
+    """Extract one verdict section body up to the next same-level heading."""
+    depth = len(header.group("hash"))
+    line_end = content.find("\n", header.end())
+    rest = content[line_end + 1 :] if line_end != -1 else ""
+    next_heading = re.search(rf"^[ ]{{0,3}}#{{1,{depth}}}[ \t]+", rest, re.MULTILINE)
+    return rest[: next_heading.start()] if next_heading else rest
+
+
+def _clean_verdict_line(line: str) -> str:
+    """Remove harmless Markdown emphasis before parsing a decision line."""
+    return re.sub(r"[`*_]", "", line)
+
+
+def _decision_from_body(body: str) -> str | None:
+    """Parse exactly one concrete ADOPT/ADAPT/BUILD disposition."""
+    decisions: list[tuple[str, str]] = []
+    for raw_line in body.splitlines():
+        line = _clean_verdict_line(raw_line)
+        match = _VERDICT_LINE.match(line) or _PROSE_VERDICT_LINE.match(line)
+        if not match:
+            continue
+        decision = match.group("decision").upper()
+        rest = match.group("rest").strip()
+        evidence_field = re.search(
+            rf"(?<!\w)[ \t]+{_EVIDENCE_LABEL}\s*:",
+            rest,
+            re.IGNORECASE,
+        )
+        if evidence_field:
+            rest = rest[: evidence_field.start()].strip()
+        negated = any(
+            match.group("decision").upper() == decision
+            for match in _NEGATED_DECISION.finditer(rest)
+        )
+        if (
+            _UNDECIDED.search(rest)
+            or _AMBIGUOUS_VERDICT.search(rest)
+            or negated
+        ):
+            return None
+        if decision != "BUILD" and not any(character.isalnum() for character in rest):
+            return None
+        decisions.append((decision, rest))
+    if len(decisions) != 1:
+        return None
+    return decisions[0][0]
+
+
+def _has_build_evidence(body: str) -> bool:
+    """Require non-placeholder search, findings, and time-to-capability fields."""
+    field_start = (
+        r"(?:^|(?<=[.!?;,])[ \t]+)[ \t]*(?:[-*+][ \t]+)?[*_`]*"
+    )
+    field_end = rf"(?=[ \t]+[*_`]*{_EVIDENCE_LABEL}[*_`]*\s*:|[\r\n]|$)"
+    labels = {
+        "searched": re.compile(
+            rf"{field_start}(?:searched|search[ \t_-]+evidence)[*_`]*\s*:\s*(.*?){field_end}",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+        "found": re.compile(
+            rf"{field_start}(?:found|findings?|discovery|discoveries|results?)[*_`]*\s*:\s*(.*?){field_end}",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+        "time": re.compile(
+            rf"{field_start}time[ \t_-]+to[ \t_-]+capability[*_`]*\s*:\s*([^\r\n]*)",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    }
+    values: dict[str, str] = {}
+    for name, pattern in labels.items():
+        match = pattern.search(body)
+        if not match:
+            return False
+        value = match.group(1).strip(" `*_\t")
+        if (
+            not value
+            or not any(character.isalnum() for character in value)
+            or _PLACEHOLDER_EVIDENCE.fullmatch(value)
+            or _UNRESOLVED_EVIDENCE.search(value)
+        ):
+            return False
+        values[name] = value
+
+    if re.fullmatch(
+        r"(?:none|n/?a|not searched|no searches?|no search terms?|[-—])\W*",
+        values["searched"],
+        re.I,
+    ) or re.match(
+        r"^(?:will|plan(?:s)? to|intend(?:s)? to|need to) search\b|"
+        r"^(?:not|have not|haven't) (?:yet )?searched\b",
+        values["searched"],
+        re.I,
+    ):
         return False
-    depth = len(m.group(0)) - len(m.group(0).lstrip("#"))
-    # From the end of the HEADER LINE, not the end of the regex match. The
-    # pattern stops at the first of adapt|build, so "## Adopt / Adapt / Build"
-    # leaves "/ Build" unconsumed — and that remnant is itself a matching token,
-    # so slicing at m.end() let every heading satisfy its own section.
-    line_end = content.find("\n", m.end())
-    rest = content[line_end + 1:] if line_end != -1 else ""
-    nxt = re.search(rf"^#{{1,{max(depth, 1)}}}\s", rest, re.MULTILINE)
-    body = rest[: nxt.start()] if nxt else rest
-    return bool(_VERDICT_TOKEN.search(body))
+    return bool(
+        re.search(
+            r"\b\d+(?:\.\d+)?[ \t]*(?:m|mins?|minutes?|h|hrs?|hours?|"
+            r"d|days?|w|wks?|weeks?|mo|months?)\b",
+            values["time"],
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_verdict(content: str) -> bool:
+    """Return whether the live verdict section contains a valid disposition."""
+    headers = list(_VERDICT_HEADER.finditer(content))
+    if len(headers) != 1:
+        return False
+    body = _section_body(content, headers[0])
+    if _UNRESOLVED_FOLLOWUP.search(body) or _UNRESOLVED_STATUS.search(body):
+        return False
+    decision = _decision_from_body(body)
+    return bool(decision and (decision != "BUILD" or _has_build_evidence(body)))
+
+
+def _repo_relative_source_path(path: str, root: Path) -> str | None:
+    """Normalize a source path and reject absolute paths outside this repo."""
+    try:
+        root = root.resolve()
+        candidate = Path(path.replace("\\", os.sep))
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        normalized = candidate.resolve().relative_to(root).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return normalized if normalized.startswith(_GATED_PREFIX) else None
+
+
+def _extract_source_paths(content: str, root: Path) -> list[str]:
+    """Extract executable source paths from already-filtered live plan text."""
+    paths = {
+        relative
+        for match in _SOURCE_PATH.finditer(content)
+        if (relative := _repo_relative_source_path(match.group("path"), root)) is not None
+    }
+    return sorted(paths)
+
+
+def _planned_rename_destinations(content: str, root: Path) -> set[str]:
+    """Return destinations of explicit moves whose source already exists."""
+    destinations: set[str] = set()
+    for line in content.splitlines():
+        matches = [
+            (match, relative)
+            for match in _SOURCE_PATH.finditer(line)
+            if (relative := _repo_relative_source_path(match.group("path"), root)) is not None
+        ]
+        if len(matches) < 2:
+            continue
+        first, old = matches[0]
+        second, new = matches[1]
+        connector = line[first.end() : second.start()]
+        separator = connector.strip("`*_ \t")
+        explicit_pair = separator.casefold() in {"to", "->", "→"}
+        command_prefix = line[: first.start()].strip("`*_ \t")
+        shell_move = bool(
+            re.search(r"(?:^|[ \t])(?:git[ \t]+mv|mv)$", command_prefix, re.IGNORECASE)
+        ) and not separator
+        if not explicit_pair and not shell_move:
+            continue
+        if (root / old).exists():
+            destinations.add(new)
+    return destinations
 
 
 def _check_plan(payload: dict) -> int:
+    """Block a new-source plan unless its live section records a disposition."""
     plan_path = _plan_path(payload)
     if not plan_path:
         return 0  # nothing to read — never block on our own inability to find it
@@ -280,7 +584,11 @@ def _check_plan(payload: dict) -> int:
     except OSError:
         return 0
 
-    named = sorted(set(_SOURCE_PATH.findall(_FENCE.sub('', content))))
+    live = _live_plan_content(content)
+    root = _repo_root(payload)
+    if root is None:
+        return 0  # cannot tell new from existing — never block on our own blindness
+    named = _extract_source_paths(live, root)
     if not named:
         return 0  # proposes no source files — not this gate's business
 
@@ -301,14 +609,12 @@ def _check_plan(payload: dict) -> int:
     # got built now scores as "nothing new" — and 13.7% is exactly the figure a
     # reader would naively reproduce and wrongly trust, which is why both are
     # recorded here.
-    root = _repo_root(payload)
-    if root is None:
-        return 0  # cannot tell new from existing — never block on our own blindness
-    sources = [s for s in named if not (root / s).exists()]
+    renamed = _planned_rename_destinations(live, root)
+    sources = [s for s in named if s not in renamed and not (root / s).exists()]
     if not sources:
         return 0
 
-    if _has_verdict(content):
+    if _has_verdict(live):
         return 0
 
     shown = ", ".join(sources[:4]) + (" …" if len(sources) > 4 else "")
@@ -327,17 +633,36 @@ def _check_plan(payload: dict) -> int:
 
 
 def _check_new_file(payload: dict) -> int:
+    """Emit one advisory for a genuinely new module in this repository."""
     raw = field(payload, "file_path")
     if not raw:
         return 0
+    inputs = tool_input(payload)
     try:
         path = Path(raw)
-    except (ValueError, OSError):
+        root = _repo_root(payload)
+        if root is None:
+            return 0
+        root = root.resolve()
+        path = (root / path if not path.is_absolute() else path).resolve()
+        source_root = (root / _GATED_PREFIX).resolve()
+        source_root.relative_to(root)
+        path.relative_to(source_root)
+        path.relative_to(root)
+        if path.suffix[1:].lower() not in _SOURCE_EXTENSIONS:
+            return 0
+        old_raw = inputs.get("old_path") or inputs.get("source_path")
+        if isinstance(old_raw, str) and old_raw:
+            old_path = Path(old_raw)
+            old_path = (root / old_path if not old_path.is_absolute() else old_path).resolve()
+            old_path.relative_to(root)
+            old_path.relative_to(source_root)
+            if old_path.exists():
+                return 0
+    except (OSError, RuntimeError, ValueError):
         return 0
 
     posix = path.as_posix()
-    if _GATED_PREFIX not in posix:
-        return 0
     if path.exists():
         return 0  # an edit to existing code, not a new module
 
@@ -345,7 +670,8 @@ def _check_new_file(payload: dict) -> int:
     if _already_nudged(cwd):
         return 0  # once per branch — this is the whole anti-annoyance design
 
-    _mark_nudged(cwd)
+    if not _mark_nudged(cwd):
+        return 0
     nudge = (
         f"New module: {posix}\n"
         "Before building it: is there something to adopt? Default order is "
@@ -370,6 +696,7 @@ def _check_new_file(payload: dict) -> int:
 
 
 def main() -> int:
+    """Dispatch the selected hook mode and fail open on internal errors."""
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     try:
         payload = read_payload()
